@@ -1,0 +1,303 @@
+variables:
+  MAVEN_CLI_OPTS: "-s .m2/settings.xml --batch-mode"
+  MAVEN_OPTS: "-Dmaven.repo.local=.m2/repository"
+  DEPLOY_VARIABLE: "test"
+  SERVICE_NAME: n
+  IMAGE_NAME: n
+
+cache:
+  - key: n
+    paths: 
+      - n/node_modules/*
+
+.build-artifacts:
+  image: node:16-alpine
+  stage: build
+  before_script:
+    - apk add --no-cache git maven bash curl wget
+    - apk --no-cache add openjdk17-jdk
+    - apk add --no-cache python3 py3-pip
+    - curl https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-425.0.0-linux-x86_64.tar.gz > /tmp/google-cloud-cli.tar.gz
+    - mkdir -p /usr/local/gcloud
+    - tar -xzf /tmp/google-cloud-cli.tar.gz -C /usr/local/gcloud
+    - chmod -R 777 /usr/local/gcloud/
+    - /usr/local/gcloud/google-cloud-sdk/install.sh --quiet
+    - PATH=$PATH:/usr/local/gcloud/google-cloud-sdk/bin
+    - echo ${SERVICE_ACCOUNT_KEYFILE_JSON} > client-secret.json
+    - gcloud auth activate-service-account --key-file client-secret.json
+    - export GOOGLE_APPLICATION_CREDENTIALS=client-secret.json
+    - npm install -g @angular/cli
+  script:
+    - rm -rf .m2/repository
+    - echo 'Build for environment...' 
+    - mvn  $MAVEN_CLI_OPTS clean install -P $MAVEN_PROFILE
+    #- mvn $MAVEN_CLI_OPTS -f BackendApp/pom.xml com.google.cloud.tools:jib-maven-plugin:3.3.1:build
+    - mvn -f BackendApp/pom.xml jib:build -P cloud-run-$MAVEN_PROFILE -s .m2/settings.xml --batch-mode -X -D IMAGE_VERSION_ID=${IMAGE_VERSION_ID} -D COMMIT_ID=$CI_COMMIT_SHA
+  cache:
+    - key: n
+      paths:
+        - n/node_modules/*
+
+build-prod-artifacts:
+  extends: .build-artifacts
+  environment: prod
+  only:
+    - master
+build-dev-artifacts:
+  extends: .build-artifacts
+  environment: dev
+  only:
+    - development
+build-test-artifacts:
+  extends: .build-artifacts
+  environment: test
+  only:
+    - release
+build-pre-prod-artifacts:
+  extends: .build-artifacts
+  environment: pre-prod
+  only:
+    - preproduction
+
+
+.deploy-cloud-run:
+  image: google/cloud-sdk:alpine
+  stage: deploy
+  cache: []
+  script:
+    - echo "Configuring google-cloud-sdk..."
+    
+    - export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+    - export PATH=${PATH}:${HOME}/google-cloud-sdk/bin
+    - echo ${SERVICE_ACCOUNT_KEYFILE_JSON} > client-secret.json
+    - gcloud auth activate-service-account --key-file client-secret.json
+    - gcloud config set project $PROJECT_ID
+    - gcloud beta run deploy n --use-http2 --service-account=${CLOUD_RUN_DEFAULT_SERVICE_ACCOUNT} --image=${REGION_ID}-docker.pkg.dev/${PROJECT_ID}/${IMAGE_NAME}-repository/${IMAGE_NAME} --vpc-connector=${VPC_CONNECTER} --region=${REGION_ID} --platform=managed --timeout=600s --concurrency=80 --no-use-http2 --allow-unauthenticated --vpc-egress=all-traffic --user-output-enabled --port=9090 --max-instances=10 --min-instances=0 --cpu=2 --memory=1Gi --set-env-vars JAVA_TOOL_OPTIONS="-Xss256k" --execution-environment=gen2 --update-secrets=SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_CLIENT-ID=SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_CLIENT-ID:latest,SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_CLIENT-SECRET=SPRING_SECURITY_OAUTH2_CLIENT_REGISTRATION_GOOGLE_CLIENT-SECRET:latest
+
+deploy to prod:
+  extends: .deploy-cloud-run
+  environment: prod
+  variables:
+    REGION_ID: "nam-eur-asia1"
+    VPC_CONNECTER: "projects/aa/locations/europe-west1/connectors/sss"
+    GIT_STRATEGY: fetch
+  needs:
+    - job: build-prod-artifacts
+      artifacts: true
+  only:
+    - master
+deploy to dev:
+  extends: .deploy-cloud-run
+  environment: dev
+  variables:
+    REGION_ID: "nam-eur-asia1"
+    VPC_CONNECTER: "projects/aa/locations/europe-west1/connectors/sss"
+    GIT_STRATEGY: fetch
+  needs:
+    - job: build-dev-artifacts
+      artifacts: true
+  only:
+    - development
+deploy to test:
+  extends: .deploy-cloud-run
+  environment: test
+  variables:
+    REGION_ID: "nam-eur-asia1"
+    VPC_CONNECTER: "projects/aa/locations/europe-west1/connectors/sss"
+    GIT_STRATEGY: fetch
+  needs:
+    - job: build-test-artifacts
+      artifacts: true
+  only:
+    - release
+deploy to pre-prod:
+  extends: .deploy-cloud-run
+  environment: pre-prod
+  variables:
+    REGION_ID: "nam-eur-asia1"
+    VPC_CONNECTER: "projects/aa/locations/europe-west1/connectors/sss"
+    GIT_STRATEGY: fetch
+  needs:
+    - job: build-pre-prod-artifacts
+      artifacts: true
+  only:
+    - preproduction
+
+
+ 
+.generate-schema:
+  variables:
+    GIT_STRATEGY: fetch
+  stage: .post
+  script:
+    - apk add curl
+    - export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+    - echo ${SERVICE_ACCOUNT_KEYFILE_JSON} > client-secret.json
+    - gcloud auth activate-service-account --key-file client-secret.json
+    - gcloud config set project $PROJECT_ID
+    - cloud_run_url=$(gcloud run services describe ${SERVICE_NAME} --platform managed --region europe-west1 --format 'value(status.url)')
+    - echo creating bq tables
+    - curl -X POST $cloud_run_url"/rest/deploy/setup?action=${action}" --fail-with-body
+    - echo completed bq execution
+
+generate-bq-schema-prod:
+  when: manual
+  variables:
+    action: ANALYTICAL
+  environment: prod
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - master
+generate-bq-schema-dev:
+  when: manual
+  variables:
+    action: ANALYTICAL
+  environment: dev
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - development
+generate-bq-schema-test:
+  when: manual
+  variables:
+    action: ANALYTICAL
+  environment: test
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - release
+generate-bq-schema-pre-prod:
+  when: manual
+  variables:
+    action: ANALYTICAL
+  environment: pre-prod
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - preproduction
+
+generate-es-schema-prod:
+  when: manual
+  variables:
+    action: SEARCH
+  environment: prod
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - master
+generate-es-schema-dev:
+  when: manual
+  variables:
+    action: SEARCH
+  environment: dev
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - development
+generate-es-schema-test:
+  when: manual
+  variables:
+    action: SEARCH
+  environment: test
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - release
+generate-es-schema-pre-prod:
+  when: manual
+  variables:
+    action: SEARCH
+  environment: pre-prod
+  image: google/cloud-sdk:alpine
+  extends: [.generate-schema]
+  only:
+    - preproduction
+
+.load-users:
+  variables:
+    GIT_STRATEGY: fetch
+  stage: .post
+  script:
+    - apk add curl
+    - export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+    - echo ${SERVICE_ACCOUNT_KEYFILE_JSON} > client-secret.json
+    - gcloud auth activate-service-account --key-file client-secret.json
+    - gcloud config set project $PROJECT_ID
+    - cloud_run_url=$(gcloud run services describe ${SERVICE_NAME} --platform managed --region europe-west1 --format 'value(status.url)')
+    - echo loading users
+    - curl -X POST $cloud_run_url"/rest/applicationusers/loadusers" --fail-with-body
+    - echo loaded users
+
+load-appusers-prod:
+  when: manual
+  environment: prod
+  image: google/cloud-sdk:alpine
+  extends: [.load-users]
+  only:
+    - master
+load-appusers-dev:
+  when: manual
+  environment: dev
+  image: google/cloud-sdk:alpine
+  extends: [.load-users]
+  only:
+    - development
+load-appusers-test:
+  when: manual
+  environment: test
+  image: google/cloud-sdk:alpine
+  extends: [.load-users]
+  only:
+    - release
+load-appusers-pre-prod:
+  when: manual
+  environment: pre-prod
+  image: google/cloud-sdk:alpine
+  extends: [.load-users]
+  only:
+    - preproduction
+
+.create-sql:
+  variables:
+    GIT_STRATEGY: fetch
+  stage: .post
+  script:
+    - apk add curl
+    - export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+    - echo ${SERVICE_ACCOUNT_KEYFILE_JSON} > client-secret.json
+    - gcloud auth activate-service-account --key-file client-secret.json
+    - gcloud config set project $PROJECT_ID
+    - cloud_run_url=$(gcloud run services describe ${SERVICE_NAME} --platform managed --region europe-west1 --format 'value(status.url)')
+    - echo creating sql script
+    - curl -X POST $cloud_run_url"/rest/rdbms/generatesqlscript" --fail-with-body
+    - echo created sql script
+
+create-sql-prod:
+  when: manual
+  environment: prod
+  image: google/cloud-sdk:alpine
+  extends: [.create-sql]
+  only:
+    - master
+create-sql-dev:
+  when: manual
+  environment: dev
+  image: google/cloud-sdk:alpine
+  extends: [.create-sql]
+  only:
+    - development
+create-sql-test:
+  when: manual
+  environment: test
+  image: google/cloud-sdk:alpine
+  extends: [.create-sql]
+  only:
+    - release
+create-sql-pre-prod:
+  when: manual
+  environment: pre-prod
+  image: google/cloud-sdk:alpine
+  extends: [.create-sql]
+  only:
+    - preproduction

@@ -1,0 +1,3 @@
+com.a.n.config.ApplicationRepositoriesAutoConfiguration
+com.a.n.config.ApplicationTransactionManagersAutoConfig
+com.a.n.config.ApplicationProvidersAutoConfiguration
